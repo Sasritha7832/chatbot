@@ -1,7 +1,7 @@
 flask
 numpy
 gunicorn
-google-generativeai
+google-genai
 python-dotenv
 PyPDF2
 werkzeug
