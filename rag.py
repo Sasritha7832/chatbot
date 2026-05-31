@@ -3,8 +3,7 @@ import glob
 import pickle
 import numpy as np
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from sentence_transformers import SentenceTransformer
 from PyPDF2 import PdfReader
 
 load_dotenv()
@@ -14,15 +13,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(BASE_DIR, 'data', 'docs')
 VECTOR_STORE_PATH = os.path.join(BASE_DIR, 'data', 'vector_store.pkl')
 
-EMBEDDING_MODEL = 'text-embedding-004'
+# Lazy-loaded local embedding model (no API key needed)
+_embedding_model = None
 
 
-def _get_client():
-    """Creates a Gemini client using the env key."""
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY environment variable is not set.")
-    return genai.Client(api_key=api_key)
+def get_embedding_model():
+    """Loads the local sentence-transformer model (cached after first load)."""
+    global _embedding_model
+    if _embedding_model is None:
+        print("Loading embedding model (first-time download ~90MB)...")
+        _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        print("Embedding model loaded.")
+    return _embedding_model
 
 
 def chunk_text(text, chunk_size=1000, overlap=200):
@@ -55,11 +57,6 @@ def ingest_documents():
     """
     os.makedirs(DOCS_DIR, exist_ok=True)
 
-    try:
-        client = _get_client()
-    except ValueError as e:
-        return False, str(e)
-
     docs = []
 
     for txt_file in glob.glob(os.path.join(DOCS_DIR, '*.txt')):
@@ -84,17 +81,10 @@ def ingest_documents():
 
     print(f"Generating embeddings for {len(all_chunks)} chunks...")
     try:
-        all_embeddings = []
-        batch_size = 100
-        for i in range(0, len(all_chunks), batch_size):
-            batch = all_chunks[i:i + batch_size]
-            result = client.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=batch,
-                config=types.EmbedContentConfig(task_type='RETRIEVAL_DOCUMENT')
-            )
-            all_embeddings.extend([emb.values for emb in result.embeddings])
+        model = get_embedding_model()
+        all_embeddings = model.encode(all_chunks, show_progress_bar=False)
 
+        os.makedirs(os.path.dirname(VECTOR_STORE_PATH), exist_ok=True)
         with open(VECTOR_STORE_PATH, 'wb') as f:
             pickle.dump({
                 "chunks": all_chunks,
@@ -133,17 +123,12 @@ def retrieve_context(query, top_k=3):
         return ""
 
     try:
-        client = _get_client()
-        result = client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=query,
-            config=types.EmbedContentConfig(task_type='RETRIEVAL_QUERY')
-        )
-        query_embedding = np.array(result.embeddings[0].values)
+        model = get_embedding_model()
+        query_embedding = model.encode([query])[0]
 
         similarities = [cosine_similarity(query_embedding, emb) for emb in embeddings]
         top_indices = np.argsort(similarities)[-top_k:][::-1]
-        filtered = [i for i in top_indices if similarities[i] > 0.55]
+        filtered = [i for i in top_indices if similarities[i] > 0.40]
         retrieved = [chunks[i] for i in filtered]
 
         return "\n\n---\n\n".join(retrieved) if retrieved else ""

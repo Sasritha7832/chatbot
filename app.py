@@ -2,8 +2,7 @@ import os
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from groq import Groq
 
 from rag import retrieve_context, ingest_documents
 
@@ -24,10 +23,10 @@ def allowed_file(filename):
 
 
 def get_client():
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
-        raise ValueError("GEMINI_API_KEY is not set.")
-    return genai.Client(api_key=api_key)
+        raise ValueError("GROQ_API_KEY is not set.")
+    return Groq(api_key=api_key)
 
 
 @app.route('/')
@@ -38,7 +37,7 @@ def home():
 @app.route('/health')
 def health():
     """Diagnostic endpoint — visit /health to confirm the key is set."""
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
     key_set = bool(api_key)
     return jsonify({
         "status": "ok",
@@ -79,11 +78,11 @@ def upload_file():
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         return jsonify({
             "response": (
-                "⚠️ **Configuration Error**: `GEMINI_API_KEY` is not set on this server.\n\n"
+                "⚠️ **Configuration Error**: `GROQ_API_KEY` is not set on this server.\n\n"
                 "Go to your Render Web Service → **Environment** tab and add your key."
             ),
             "tag": "error",
@@ -103,7 +102,7 @@ def chat():
         })
 
     try:
-        client = genai.Client(api_key=api_key)
+        client = Groq(api_key=api_key)
 
         # Retrieve RAG context (best-effort)
         context = retrieve_context(user_message)
@@ -122,17 +121,17 @@ def chat():
                 "=== CONTEXT END ==="
             )
 
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=user_message,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-            )
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ]
         )
 
         return jsonify({
-            "response": response.text,
-            "tag": "gemini",
+            "response": completion.choices[0].message.content,
+            "tag": "groq",
             "confidence": 1.0
         })
 
@@ -142,7 +141,7 @@ def chat():
         return jsonify({
             "response": (
                 f"⚠️ **AI Error**: {error_str}\n\n"
-                "Please check that your Gemini API key is valid."
+                "Please check that your Groq API key is valid."
             ),
             "tag": "error",
             "confidence": 0.0

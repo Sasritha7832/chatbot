@@ -1,7 +1,8 @@
 flask
 numpy
 gunicorn
-google-genai
+groq
 python-dotenv
 PyPDF2
 werkzeug
+sentence-transformers
