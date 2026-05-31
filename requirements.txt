@@ -1,5 +1,7 @@
 flask
-scikit-learn
-nltk
 numpy
 gunicorn
+google-generativeai
+python-dotenv
+PyPDF2
+werkzeug

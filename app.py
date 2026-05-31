@@ -1,88 +1,77 @@
 import os
 import json
-import pickle
-import random
-import string
 from flask import Flask, request, jsonify, render_template
+from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
+import google.generativeai as genai
 
-import nltk
-from nltk.stem import WordNetLemmatizer
+from rag import retrieve_context, ingest_documents
+
+# Load environment variables
+load_dotenv()
 
 app = Flask(__name__)
 
-# Ensure NLTK resources are loaded
-nltk.download('punkt', quiet=True)
-nltk.download('punkt_tab', quiet=True)
-nltk.download('wordnet', quiet=True)
-nltk.download('omw-1.4', quiet=True)
-
-lemmatizer = WordNetLemmatizer()
+# Configure API
+API_KEY = os.environ.get("GEMINI_API_KEY")
+if API_KEY:
+    genai.configure(api_key=API_KEY)
 
 # Define paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, 'model', 'chatbot_model.pkl')
-VECTORIZER_PATH = os.path.join(BASE_DIR, 'model', 'vectorizer.pkl')
-INTENTS_PATH = os.path.join(BASE_DIR, 'data', 'intents.json')
+DOCS_DIR = os.path.join(BASE_DIR, 'data', 'docs')
 
-# Global variables for models and data
-model = None
-vectorizer = None
-intents_data = {}
+# Ensure docs directory exists
+os.makedirs(DOCS_DIR, exist_ok=True)
 
-def load_resources():
-    """Loads the model, vectorizer, and intents JSON."""
-    global model, vectorizer, intents_data
-    
-    print("Loading chatbot ML resources...")
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(VECTORIZER_PATH):
-        print("WARNING: Model or Vectorizer pkl files not found! Please run train.py first.")
-        return False
-        
-    with open(MODEL_PATH, 'rb') as f:
-        model = pickle.load(f)
-        
-    with open(VECTORIZER_PATH, 'rb') as f:
-        vectorizer = pickle.load(f)
-        
-    with open(INTENTS_PATH, 'r', encoding='utf-8') as f:
-        intents_data = json.load(f)
-        
-    print("Resources loaded successfully.")
-    return True
+# Allowed file extensions for upload
+ALLOWED_EXTENSIONS = {'txt', 'pdf'}
 
-def preprocess_text(text):
-    """
-    Tokenizes, lowercases, removes punctuation, and lemmatizes the input text.
-    Must match the preprocessing used in train.py.
-    """
-    tokens = nltk.word_tokenize(text.lower())
-    cleaned_tokens = [
-        lemmatizer.lemmatize(token)
-        for token in tokens
-        if token not in string.punctuation
-    ]
-    return " ".join(cleaned_tokens)
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 @app.route('/')
 def home():
     """Serves the single-page frontend chat UI."""
     return render_template('index.html')
 
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """Handles file uploads for the RAG knowledge base."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+        
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(DOCS_DIR, filename)
+        file.save(file_path)
+        
+        # Trigger ingestion to update the vector store
+        success = ingest_documents()
+        
+        if success:
+            return jsonify({"success": True, "message": f"File '{filename}' successfully added to knowledge base!"})
+        else:
+            return jsonify({"error": "File saved, but embedding failed. Check API key."}), 500
+            
+    return jsonify({"error": "Invalid file type. Only TXT and PDF are allowed."}), 400
+
 @app.route('/chat', methods=['POST'])
 def chat():
     """
-    Accepts user message, predicts the intent,
-    and returns a random response.
+    Accepts user message, retrieves relevant context from RAG,
+    and queries the Gemini LLM for a response.
     """
-    if model is None or vectorizer is None:
-        # Try loading dynamically if they weren't ready at startup
-        success = load_resources()
-        if not success:
-            return jsonify({
-                "response": "Chatbot model is not trained or loaded. Please check the backend.",
-                "tag": "error",
-                "confidence": 0.0
-            }), 500
+    if not API_KEY:
+        return jsonify({
+            "response": "ERROR: GEMINI_API_KEY is not set in the environment variables or .env file. Please add it to use the chatbot.",
+            "tag": "error",
+            "confidence": 0.0
+        }), 500
 
     data = request.get_json()
     if not data or 'message' not in data:
@@ -96,43 +85,53 @@ def chat():
             "confidence": 1.0
         })
 
-    # Preprocess and vectorize the message
-    processed_message = preprocess_text(user_message)
-    features = vectorizer.transform([processed_message])
-    
-    # Predict probability distribution
-    probabilities = model.predict_proba(features)[0]
-    max_idx = int(probabilities.argmax())
-    max_prob = float(probabilities[max_idx])
-    predicted_tag = model.classes_[max_idx]
-    
-    # Confidence threshold fallback
-    if max_prob < 0.4:
+    try:
+        # Retrieve context from RAG engine
+        context = retrieve_context(user_message)
+        
+        # Build prompt
+        system_prompt = (
+            "You are NexaBot, an intelligent, helpful, and friendly AI assistant. "
+            "You format your responses beautifully using Markdown. "
+        )
+        
+        if context:
+            system_prompt += (
+                "You have been provided with the following context documents to help answer the user's question. "
+                "Use this context if it's relevant, but you can also answer general questions.\n\n"
+                "=== CONTEXT START ===\n"
+                f"{context}\n"
+                "=== CONTEXT END ===\n"
+            )
+
+        # Initialize the model (using flash for speed and cost-effectiveness)
+        model = genai.GenerativeModel(
+            model_name='gemini-2.0-flash',
+            system_instruction=system_prompt
+        )
+        
+        # Note: In a real app we'd pass the chat history to the API.
+        # For simplicity and to match the old stateless backend (which relied on frontend history),
+        # we'll just pass the current message.
+        response = model.generate_content(user_message)
+        
         return jsonify({
-            "response": "I don't understand. Could you please rephrase or try another query?",
-            "tag": "fallback",
-            "confidence": max_prob
+            "response": response.text,
+            "tag": "gemini",
+            "confidence": 1.0
         })
         
-    # Get random response corresponding to the predicted intent tag
-    responses = None
-    for intent in intents_data.get('intents', []):
-        if intent['tag'] == predicted_tag:
-            responses = intent['responses']
-            break
-            
-    if responses:
-        response_text = random.choice(responses)
-    else:
-        response_text = "I don't understand. Could you please rephrase or try another query?"
-        
-    return jsonify({
-        "response": response_text,
-        "tag": predicted_tag,
-        "confidence": max_prob
-    })
+    except Exception as e:
+        print(f"Chat error: {e}")
+        return jsonify({
+            "response": f"Sorry, I encountered an error communicating with the AI: {str(e)}",
+            "tag": "error",
+            "confidence": 0.0
+        }), 500
 
 if __name__ == '__main__':
-    # Load resources before running the server
-    load_resources()
+    # Initialize empty vector store if it doesn't exist
+    if not os.path.exists(os.path.join(BASE_DIR, 'data', 'vector_store.pkl')):
+        ingest_documents()
+        
     app.run(host='127.0.0.1', port=5000, debug=True)
