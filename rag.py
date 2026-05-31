@@ -35,70 +35,73 @@ def extract_text_from_pdf(pdf_path):
     return text
 
 def ingest_documents():
-    """Reads all docs, chunks them, embeds them, and saves to vector store."""
-    if not os.path.exists(DOCS_DIR):
-        os.makedirs(DOCS_DIR)
-        
+    """
+    Reads all docs, chunks them, embeds them, and saves to vector store.
+    Returns (True, None) on success or (False, error_message) on failure.
+    """
+    os.makedirs(DOCS_DIR, exist_ok=True)
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("ERROR: GEMINI_API_KEY is missing. Cannot embed documents.")
-        return False
-        
+        msg = "GEMINI_API_KEY environment variable is not set on this server."
+        print(f"ERROR: {msg}")
+        return False, msg
+
     genai.configure(api_key=api_key)
-    
+
     docs = []
-    
+
     # Process TXT files
     for txt_file in glob.glob(os.path.join(DOCS_DIR, '*.txt')):
         with open(txt_file, 'r', encoding='utf-8') as f:
             docs.append({"filename": os.path.basename(txt_file), "text": f.read()})
-            
+
     # Process PDF files
     for pdf_file in glob.glob(os.path.join(DOCS_DIR, '*.pdf')):
         text = extract_text_from_pdf(pdf_file)
         if text:
             docs.append({"filename": os.path.basename(pdf_file), "text": text})
-            
+
     if not docs:
         print("No documents found in data/docs/. Vector store is empty.")
-        # Create empty store
         with open(VECTOR_STORE_PATH, 'wb') as f:
             pickle.dump({"chunks": [], "embeddings": []}, f)
-        return True
-        
+        return True, None
+
     all_chunks = []
-    all_embeddings = []
-    
+
     print(f"Processing {len(docs)} document(s)...")
     for doc in docs:
         chunks = chunk_text(doc["text"])
         for chunk in chunks:
-            chunk_metadata = f"Source: {doc['filename']}\n\n{chunk}"
-            all_chunks.append(chunk_metadata)
-            
-    # Generate embeddings
+            all_chunks.append(f"Source: {doc['filename']}\n\n{chunk}")
+
+    # Generate embeddings in batches of 100 to avoid API limits
     print(f"Generating embeddings for {len(all_chunks)} chunks...")
     try:
-        # We can batch embed
-        result = genai.embed_content(
-            model=EMBEDDING_MODEL,
-            content=all_chunks,
-            task_type="retrieval_document"
-        )
-        all_embeddings = result['embedding']
-        
-        # Save to disk
+        all_embeddings = []
+        batch_size = 100
+        for i in range(0, len(all_chunks), batch_size):
+            batch = all_chunks[i:i + batch_size]
+            result = genai.embed_content(
+                model=EMBEDDING_MODEL,
+                content=batch,
+                task_type="retrieval_document"
+            )
+            all_embeddings.extend(result['embedding'])
+
         with open(VECTOR_STORE_PATH, 'wb') as f:
             pickle.dump({
                 "chunks": all_chunks,
                 "embeddings": np.array(all_embeddings)
             }, f)
-            
+
         print(f"Successfully saved {len(all_chunks)} embeddings to vector store.")
-        return True
+        return True, None
     except Exception as e:
-        print(f"Error generating embeddings: {e}")
-        return False
+        msg = str(e)
+        print(f"Error generating embeddings: {msg}")
+        return False, msg
 
 def cosine_similarity(a, b):
     # Avoid division by zero
